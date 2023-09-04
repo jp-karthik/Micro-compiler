@@ -1,0 +1,1856 @@
+%{  
+    /* author: @karthikjp */    
+    #include "model.hpp" 
+    #include <algorithm>
+    using namespace std;
+    int yylex();
+    void yyerror(const char* s);
+%}
+%code requires {
+    class ASTnode1 {
+        public:
+        std::string factor_1;
+        std::string factor_2;
+        std::string result;
+        std::string type;
+        std::string opType;
+        std::string curInstruction;        
+        std::vector<std::string> codeGenList;
+        std::string label;
+        std::string outlabel;
+        std::string jumpIns;
+        ASTnode1* left;
+        ASTnode1* right;
+        ASTnode1* parent;
+        std::vector<ASTnode1*> expressions;
+        ASTnode1() {
+            this->left = NULL;
+            this->right = NULL;
+            this->parent = NULL;
+        }
+    };
+}
+%union 
+{
+    std::pair<std::string, int>* identifier;
+    char* str;
+    ASTnode1* astnode;
+};
+// NON TERMINALS
+%type <astnode> var_type
+%type <astnode> expr expr_prefix
+%type <astnode> factor factor_prefix postfix_expr
+%type <astnode> primary
+%type <astnode> mulop addop
+%type <astnode> if_stmt else_part cond compop
+%type <astnode> string_decl var_decl func_decl func_body decl
+%type <astnode> id_list id_tail id 
+%type <astnode> pgm_body
+%type <astnode> func_declarations param_decl param_decl_list param_decl_tail
+%type<astnode> stmt stmt_list read_stmt write_stmt assign_stmt return_stmt
+%type<astnode> while_stmt base_stmt assign_expr
+%type<astnode> aug_if_stmt aug_else_part aug_stmt aug_stmt_list
+%type<astnode> expr_list expr_list_tail call_expr
+%type<astnode> any_type 
+/* Defining tokens */
+/******************************************************/
+/* KEYWORDS */
+/******************************************************/
+%token<str> PROGRAM
+%token<str> END 
+%token<str> pBEGIN 
+%token<str> STRING 
+%token<str> INT
+%token<str> FLOAT
+%token<str> READ
+%token<str> WRITE
+%token<str> RETURN
+%token<str> FUNCTION
+%token<str> IF
+%token<str> ENDIF
+%token<str> ELSE
+%token<str> WHILE
+%token<str> ENDWHILE
+%token<str> CONTINUE
+%token<str> BREAK
+%token VOID
+/******************************************************/
+/* REGEX tokens */
+/******************************************************/
+%token<identifier> IDENTIFIER
+%token<str> STRINGLITERAL 
+%token<str> INTLITERAL
+%token<str> FLOATLITERAL
+%token<str> ASSIGN 
+%token SEMICOL 
+%token COMMA
+%token LEFT_PAR RIGHT_PAR
+%token PLUS MINUS MUL DIV
+%token EQ NEQ GT GEQ LT LEQ
+%%
+/* set of CFG productions */
+/******************************************************/
+/* Program */
+/******************************************************/
+program: 
+    PROGRAM IDENTIFIER 
+    { 
+        curST = new SYMBOL_TABLE();
+        globalNode = new ASTnode();
+        curST->st_name = "GLOBAL";
+        symbol_tables.push_back(curST);
+        PST.push_back(curST);
+    }
+    pBEGIN pgm_body END 
+    {   
+        PST.pop_back();
+        ASTnode1* child = ($5); 
+        if (child) 
+        {
+            for (auto code : child->codeGenList) 
+            {
+                globalNode->codeGenList.push_back(code);
+            }
+        }
+        vector<string> tinyCode;
+        for (auto& code : globalNode->codeGenList) 
+        {
+            if (code == "sys halt") 
+            {
+                tinyCode.push_back(code);
+                continue;
+            }
+            vector<string> components;
+            string cur = "";
+            for (int i = 0; i < code.length(); i++) 
+            {
+                if (code[i] == ' ') 
+                {
+                    components.push_back(cur);
+                    cur = "";
+                } 
+                else 
+                {
+                    cur += code[i];
+                }
+            }
+            if (cur.length() > 0) components.push_back(cur);
+            if (components[0] == "push" || components[0] == "pop") 
+            {
+                tinyCode.push_back(code);
+                continue;
+            }
+            if (components[0] == "jsr") 
+            {
+                tinyCode.push_back(code);
+                continue;
+            }
+            if (components[0] == "link" || components[0] == "unlnk") {
+                tinyCode.push_back(code);
+                continue;
+            }
+            if (components[0] == "var" || components[0] == "str") 
+            {
+                tinyCode.push_back(code);
+                continue;
+            }
+            if (components[0] == "ret") {
+                tinyCode.push_back(code);
+                continue;
+            }
+            if (components[0] == "label") {
+                tinyCode.push_back(code);
+                continue;
+            }
+            if (components[0][0] == 'c' && components[0][1] == 'm' && components[0][2] == 'p') {
+                if (checkRegister(components[2]) == false) 
+                {       
+                    string reg = generateRegister();
+                    string ins1 = "move " + components[2] + " " + reg;
+                    string ins2 = components[0] + " " + components[1] + " " + reg;
+                    tinyCode.push_back(ins1);
+                    tinyCode.push_back(ins2);
+                } else {
+                    tinyCode.push_back(code);
+                }                
+                continue;
+            }
+            if (components[0][0] == 'j') {
+                tinyCode.push_back(code);
+                continue;
+            }
+            if (components[0] == "STOREI" || components[0] == "STOREF") 
+            {
+                if (checkRegister(components[2])) {
+                    // MOV <> RX
+                    string ins = "move " + components[1] + " " + components[2];
+                    tinyCode.push_back(ins);
+                    continue;
+                }
+                if (checkRegister(components[1])) {
+                    // MOVE RX <>
+                    string ins = "move " + components[1] + " " + components[2];
+                    tinyCode.push_back(ins);
+                } else {
+                    // The following 3AC (STORE I/M M) can be broken down into :
+                    /*
+                        MOVE I/M RX
+                        MOVE RX M
+                    */
+                    string reg = generateRegister();
+                    string ins1 = "move " + components[1] + " " + reg;
+                    string ins2 = "move " + reg + " " + components[2];
+                    tinyCode.push_back(ins1);
+                    tinyCode.push_back(ins2);
+                }
+                continue;
+            }
+            bool cnd = components[0] == "WRITEI" || components[0] == "WRITEF" || components[0] == "WRITES" || components[0] == "READI" || components[0] == "READF";
+            if (cnd) 
+            {
+                for (auto& c : components[0]) 
+                {
+                    c = 'a'-'A'+c;
+                }
+                if (components[0].back() == 'f') 
+                {
+                    components[0][components[0].size()-1] = 'r';
+                }
+                string ins = "sys " + components[0] + " " + components[1];
+                tinyCode.push_back(ins);                
+                continue;
+            
+            }
+            if (components[0] == "MULI") 
+            {
+                // MULI x y r3
+                string ins1 = "move " + components[1] + " " + components[3];
+                string ins2 = "muli " + components[2] + " " + components[3];
+                tinyCode.push_back(ins1);
+                tinyCode.push_back(ins2);
+                continue;
+            }
+            if (components[0] == "ADDI") 
+            {
+                // ADDI x y r3
+                string ins1 = "move " + components[1] + " " + components[3];
+                string ins2 = "addi " + components[2] + " " + components[3];
+                tinyCode.push_back(ins1);
+                tinyCode.push_back(ins2);
+                continue;
+            }
+            if (components[0] == "SUBI") 
+            {
+                // SUBI x y r3
+                string ins1 = "move " + components[1] + " " + components[3];
+                string ins2 = "subi " + components[2] + " " + components[3];                
+                tinyCode.push_back(ins1);
+                tinyCode.push_back(ins2);
+                continue;
+            }
+            if (components[0] == "DIVI") 
+            {
+                // DIVI x y r3   
+                string ins1 = "move " + components[1] + " " + components[3];
+                string ins2 = "divi " + components[2] + " " + components[3];
+                tinyCode.push_back(ins1);
+                tinyCode.push_back(ins2);
+                continue;
+            }
+            if (components[0] == "MULF") 
+            {
+                // MULI x y r3                
+                string ins1 = "move " + components[1] + " " + components[3];
+                string ins2 = "mulr " + components[2] + " " + components[3];
+                tinyCode.push_back(ins1);
+                tinyCode.push_back(ins2);
+                continue;
+            }
+            if (components[0] == "ADDF") 
+            {
+                // ADDI x y r3
+                string ins1 = "move " + components[1] + " " + components[3];
+                string ins2 = "addr " + components[2] + " " + components[3];
+                tinyCode.push_back(ins1);
+                tinyCode.push_back(ins2);
+                continue;
+            }
+            if (components[0] == "SUBF") 
+            {
+                // SUBI x y r3
+                string ins1 = "move " + components[1] + " " + components[3];
+                string ins2 = "subr " + components[2] + " " + components[3];
+                tinyCode.push_back(ins1);
+                tinyCode.push_back(ins2);
+                continue;
+            }
+            if (components[0] == "DIVF") {
+                // DIVI x y r3
+                string ins1 = "move " + components[1] + " " + components[3];
+                string ins2 = "divr " + components[2] + " " + components[3];
+                tinyCode.push_back(ins1);
+                tinyCode.push_back(ins2);
+                continue;
+            }
+        }
+
+        for (int i = 0; i < regCnt; i++) {
+            cout << "var " << " t_" << i << endl;
+        }
+
+        for (auto code : tinyCode) 
+        {
+            vector<string> C;
+            string cur = "";
+            for (int i = 0; i < code.length(); i++) 
+            {
+                if (code[i] == ' ') 
+                {
+                    C.push_back(cur);
+                    cur = "";
+                } 
+                else 
+                {
+                    cur += code[i];
+                }
+            }
+            if (cur.length() > 0) C.push_back(cur);
+            bool cnd = (C[0] == "addi" || C[0] == "addr" || C[0] == "muli" || C[0] == "mulr" || C[0] == "subi" || C[0] == "subr" || C[0] == "divi" || C[0] == "divr"); 
+            if (cnd) {
+                // opcode op1 op2
+                string op1 = C[1];
+                string op2 = C[2];
+                string reg = "r0";
+                bool rReq = false;
+                if (checkRegister(op1)) op1 = "t_" + op1.substr(1);
+                if (checkRegister(op2)) op2 = "t_" + op2.substr(1);
+                cout << "move " + op2 + " " + reg << endl;
+                cout << C[0] + " " + op1 + " " + reg << endl;
+                cout << "move " + reg + " " + op2 << endl;
+                continue;
+            }
+            if (C[0] == "move") {
+                // move op1 op2
+                string op1 = C[1];
+                string op2 = C[2];
+                if (checkRegister(op1)) op1 = "t_" + op1.substr(1);
+                if (checkRegister(op2)) op2 = "t_" + op2.substr(1);
+                string reg = "r0";
+                cout << "move " << op1 << " " << reg << endl;
+                cout << "move " << reg << " " << op2 << endl;
+                continue;
+            }
+            if (C[0] == "cmpr" || C[0] == "cmpi") {
+                string op1 = C[1];
+                string op2 = C[2];
+                string reg = "r0";
+                if (checkRegister(op1)) op1 = "t_" + op1.substr(1);
+                if (checkRegister(op2)) op2 = "t_" + op2.substr(1);
+                cout << "move " << op2 << " " << reg << endl;
+                cout << C[0] << " " << op1 << " " << reg << endl;
+                continue;
+            }
+            if (C[0] == "push" || C[0] == "pop") {
+                if (C.size() > 1) {
+                    if (checkRegister(C[1])) {
+                        string op = "t_" + C[1].substr(1);
+                        cout << C[0] << " " << op << endl;
+                    } else {
+                        cout << code << endl;
+                    }
+                } else cout << code << endl;
+                continue;
+            }
+            cout << code << endl;
+        }
+    }
+;
+id:
+    IDENTIFIER 
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        if (curVarType == "WRITE" || curVarType == "READ") {
+            curNode->curInstruction = curVarType;
+            string ID = ($1)->first;
+            bool found = false;
+            bool isString = false;
+            int IDX = -1;
+            for (int symidx = PST.size()-1; symidx >= 0; symidx--) {
+                if (found) break;
+                for (int i = 0; i < PST[symidx]->VARS.size(); i++) 
+                {
+                    if (ID == PST[symidx]->VARS[i]->id) 
+                    {
+                        IDX = symidx;
+                        found = true;
+                        if (PST[symidx]->VARS[i]->type == "INT") 
+                        {
+                            curNode->curInstruction += "I ";
+                        }
+                        else {
+                            curNode->curInstruction += "F ";
+                        }
+                        break;       
+                    }
+                }
+                if (!found) {
+                    for (int i = 0; i < PST[symidx]->STRING_VARS.size(); i++) {
+                        if (ID == PST[symidx]->STRING_VARS[i]->id) {
+                            found = true;
+                            IDX = symidx;
+                            curNode->curInstruction += "S ";
+                            isString = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (found) {
+                if (isString) {
+                    curNode->curInstruction += ID + "_" + PST[IDX]->st_name;
+                } else {
+                    if (IDX > 0) {
+                        curNode->curInstruction += PST[IDX]->varMap[ID];
+                    } else {
+                        curNode->curInstruction += ID;
+                    }
+                }
+            }
+            curNode->codeGenList.push_back(curNode->curInstruction);
+            curNode->curInstruction = "";
+        }
+        if (curVarType == "INT" || curVarType == "FLOAT") {
+            if (curST->whoseFirst == "") {
+                curST->whoseFirst = "VAR";
+            }
+            string ID = ($1)->first;
+            int line = ($1)->second;
+            for (auto& var: curST->VARS) {
+                if (var->id == ID) {
+                    cout << "DECLARATION ERROR " << ID << " (previous declaration was at line " << var->line << ")"<< endl;
+                    return 0;
+                }
+            }
+            for (auto& strvar: curST->STRING_VARS) {
+                if (strvar->id == ID) {
+                    cout << "DECLARATION ERROR " << ID << " (previous declaration was at line " << strvar->line << ")"<< endl;
+                    return 0;
+                }
+            }
+            VARIABLE_DECLARATION* varDeclObj = new VARIABLE_DECLARATION();
+            varDeclObj->type = curVarType;
+            varDeclObj->id = ID;
+            varDeclObj->line = line;
+            curST->VARS.push_back(varDeclObj);
+            if (isArg) {
+                // if we have a local variable mapped to a argument
+                FST.back()->varMap[ID] = "$" + to_string(FST.back()->argCounter);
+                FST.back()->argCounter++;
+            } else if (PST.size() > 1) {
+                // if we have local variable not mapped to a argument
+                curST->varMap[ID] = "$-" + to_string(FST.back()->linkCounter);
+                FST.back()->linkCounter++;
+            } else {
+                // when a variable is global, no mapping is required
+                curNode->curInstruction = "var " + ID;
+                curNode->codeGenList.push_back(curNode->curInstruction);
+            }
+            curNode->curInstruction = "";
+        }   
+    }
+;
+pgm_body: 
+    decl func_declarations 
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        if (child1) 
+        {
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        curNode->codeGenList.push_back("push");
+        curNode->codeGenList.push_back("jsr main");
+        curNode->codeGenList.push_back("pop");
+        curNode->codeGenList.push_back("sys halt");
+        if (child2) 
+        {
+            for (auto code : child2->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }   
+    }
+;
+decl:
+    string_decl decl 
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        if (child1) 
+        {
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) 
+        {
+            for (auto code : child2->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|   var_decl decl
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) {
+            for (auto code : child2->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|   
+    {
+        ($$) = NULL;
+    }
+;
+/******************************************************/
+/* Global String Declaration */
+/******************************************************/
+string_decl:
+    STRING IDENTIFIER ASSIGN STRINGLITERAL SEMICOL
+    {
+        if (curST->whoseFirst == "") {
+            curST->whoseFirst = "STR_VAR";
+        } 
+        string ID = ($2)->first.c_str();
+        int line = ($2)->second;
+        string STRLIT = ($4 != NULL) ? (string) $4 : "";
+        for (auto& var: curST->VARS) 
+        {
+            if (var->id == ID) 
+            {
+                cout << "DECLARATION ERROR " << ID << " (previous declaration was at line " << var->line << ")"<< endl;
+                return 0;
+            }
+        }
+        for (auto& strvar: curST->STRING_VARS) 
+        {
+            if (strvar->id == ID) 
+            {
+                cout << "DECLARATION ERROR " << ID << " (previous declaration was at line " << strvar->line << ")"<< endl;
+                return 0;
+            }
+        }
+        STRING_VARIABLE_DECLARATION* strDeclObj = new STRING_VARIABLE_DECLARATION();
+        strDeclObj->type = "STRING";
+        strDeclObj->id = ID;
+        strDeclObj->value = STRLIT;
+        strDeclObj->line = line;
+        curST->STRING_VARS.push_back(strDeclObj);
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        curNode->type = "STRING";
+        curNode->curInstruction = "str " + ID + "_" + PST.back()->st_name + " " + STRLIT;
+        curNode->codeGenList.push_back(curNode->curInstruction);
+        curNode->curInstruction = "";
+    }
+;
+/******************************************************/
+/* Variable Declaration */
+/******************************************************/
+var_decl:
+    var_type id_list SEMICOL 
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child = ($2);
+        if (child) {
+            for (auto code : child->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+;
+var_type:
+    FLOAT 
+    {
+        curVarType = "FLOAT";
+        ($$) = new ASTnode1();
+        ($$)->type = "FLOAT";
+    }  
+|   INT 
+    {
+        curVarType = "INT";
+        ($$) = new ASTnode1();
+        ($$)->type = "INT";
+    }
+;
+any_type:
+    var_type 
+    {
+        ($$) = ($1);
+    }
+|   VOID 
+    {
+        ($$) = new ASTnode1();
+        ($$)->type = "VOID";
+    }
+;
+id_list:
+    id id_tail 
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) {
+            for (auto code : child2->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+;
+id_tail:
+    COMMA id id_tail 
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($2);
+        ASTnode1* child2 = ($3);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) {
+            for (auto code : child2->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+| 
+    {
+        ($$) = NULL;
+    }
+;
+/******************************************************/
+/* Function Parameter List */
+/******************************************************/
+param_decl_list:
+    param_decl param_decl_tail
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) {
+            for (auto code : child2->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|
+    {
+        ($$) = NULL;
+    }
+;
+param_decl:
+    var_type
+    {
+        isArg = true;
+    }
+    id
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($3);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        isArg = false;
+    }
+;
+
+param_decl_tail:
+
+    COMMA param_decl param_decl_tail 
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($2);
+        ASTnode1* child2 = ($3);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) {
+            for (auto code : child2->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+| 
+    {
+        ($$) = NULL;
+    }
+;
+/******************************************************/
+/* Function Declarations */
+/******************************************************/
+func_declarations:
+    func_decl func_declarations
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) {
+            for (auto code : child2->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    } 
+| 
+    {
+        ($$) = NULL;
+    }
+;
+func_decl:
+    FUNCTION any_type IDENTIFIER
+    {
+        string st_name = ($3)->first;
+        curST = new SYMBOL_TABLE();
+        curST->st_name = st_name;
+        symbol_tables.push_back(curST);
+        PST.push_back(curST);
+        FST.push_back(curST);
+        FRM[st_name] = ($2)->type;
+    }
+    LEFT_PAR 
+    param_decl_list 
+    RIGHT_PAR 
+    pBEGIN 
+    func_body 
+    END
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($6);
+        ASTnode1* child2 = ($9);
+        curNode->codeGenList.push_back("label " + FST.back()->st_name);
+        curNode->codeGenList.push_back("link " + to_string(FST.back()->linkCounter-1));
+        if (child1) 
+        {
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) 
+        {
+            for (auto code : child2->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (($2)->type == "VOID") {
+            curNode->codeGenList.push_back("unlnk");
+            curNode->codeGenList.push_back("ret");
+        }
+        PST.pop_back();
+        FST.pop_back();       
+    }
+;
+func_body:
+    decl stmt_list
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) {
+            for (auto code : child2->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+;
+/******************************************************/
+/* Statement List */
+/******************************************************/
+stmt_list :
+    stmt stmt_list
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) {
+            for (auto code : child2->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|  
+    {
+        ($$) = NULL;
+    }
+;
+stmt:
+    base_stmt
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child = ($1);
+        if (child) {
+            for (auto code : child->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|   if_stmt
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|   while_stmt
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+;
+base_stmt:
+    assign_stmt
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|   read_stmt
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        } 
+    }
+|   write_stmt
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|   return_stmt
+    {
+        ($$) = ($1);
+    }
+;
+/******************************************************/
+/* Basic Statements */
+/******************************************************/
+assign_stmt:
+    assign_expr SEMICOL 
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        if (child1) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+;
+assign_expr:
+    IDENTIFIER ASSIGN expr
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        string ID = ($1)->first;
+        bool found = false;
+        int IDX = -1;
+        for (int symidx = PST.size()-1; symidx >= 0; symidx--) {
+            if (found) break;
+            for (int i = 0; i < PST[symidx]->VARS.size(); i++) 
+            {
+                if (ID == PST[symidx]->VARS[i]->id) 
+                {
+                    found = true;
+                    if (PST[symidx]->VARS[i]->type == "INT") 
+                    {
+                        curNode->curInstruction += "I ";
+                        curNode->type = "INT";
+                    }
+                    else {
+                        curNode->curInstruction += "F ";
+                        curNode->type = "FLOAT";
+                    }
+                    IDX = symidx;
+                    break;       
+                }
+            }
+        }    
+        ASTnode1* child = ($3);
+        string OPTYPE = "STORE";
+        if (child) 
+        {
+            for (auto code : child->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }    
+            curNode->factor_1 = child->result;
+            if (child->type == "INT") 
+            {
+                OPTYPE += "I ";
+            } 
+            else if (child->type == "FLOAT") 
+            {
+                OPTYPE += "F ";
+            }
+        }
+        if (IDX == 0) curNode->curInstruction = OPTYPE + curNode->factor_1 + " " + ID;
+        else curNode->curInstruction = OPTYPE + curNode->factor_1 + " " + PST[IDX]->varMap[ID];
+        curNode->codeGenList.push_back(curNode->curInstruction);
+        curNode->curInstruction = "";
+    }
+;
+read_stmt:
+    READ LEFT_PAR 
+    {
+        curVarType = "READ";
+        globalNode->curInstruction = "READ";
+    } 
+    id_list RIGHT_PAR SEMICOL
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child = ($4);
+        if (child) {
+            for (auto code : child->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+;
+write_stmt:
+    WRITE LEFT_PAR 
+    {
+        curVarType = "WRITE";
+        globalNode->curInstruction = "WRITE";
+    }
+    id_list RIGHT_PAR SEMICOL
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child = ($4);
+        if (child) {
+            for (auto code : child->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+;
+return_stmt:
+    RETURN expr SEMICOL
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child = ($2);
+        if (child) {
+            for (auto code : child->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+            string curIns = "STORE";
+            if (child->type == "INT") curIns += "I";
+            else curIns += "F";
+            curIns += " " + child->result + " " + "$" + to_string(FST.back()->argCounter);   
+            curNode->codeGenList.push_back(curIns);
+            curNode->codeGenList.push_back("unlnk");
+            curNode->codeGenList.push_back("ret");
+        }
+    }
+;
+/******************************************************/
+/* Expressions */
+/******************************************************/
+expr:
+    expr_prefix factor
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        if (child1 && child2) {
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+            for (auto code : child2->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+            curNode->factor_1 = child1->result;
+            curNode->factor_2 = child2->result;
+            curNode->result = generateRegister();
+            string OPTYPE = child1->opType;
+            if (child1->type == "INT") {
+                OPTYPE += "I ";
+            } else if (child1->type == "FLOAT") {
+                OPTYPE += "F ";
+            }
+            curNode->curInstruction = OPTYPE + curNode->factor_1 + " " + curNode->factor_2 + " " + curNode->result;
+            curNode->codeGenList.push_back(curNode->curInstruction);
+            curNode->curInstruction = "";
+            curNode->type = child2->type;
+        }
+        else 
+        {
+            for (auto code : child2->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+            curNode->result = child2->result;
+            curNode->type = child2->type;
+        }
+    }
+;
+
+expr_prefix:
+    expr_prefix factor addop
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);        
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        ASTnode1* child3 = ($3);
+        if (child1 && child2) {
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+            for (auto code : child2->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+            curNode->factor_1 = child1->result;
+            curNode->factor_2 = child2->result;
+            string OPTYPE = child1->opType;
+            if (child1->type == "INT") 
+            {
+                OPTYPE += "I ";
+            }
+            else if (child1->type == "FLOAT") 
+            {
+                OPTYPE += "F ";
+            }
+            curNode->result = generateRegister();
+            curNode->curInstruction = OPTYPE + curNode->factor_1 + " " + curNode->factor_2 + " " + curNode->result;
+            curNode->codeGenList.push_back(curNode->curInstruction);
+            curNode->curInstruction = "";
+            curNode->type = child1->type;
+        }
+        else 
+        {
+            for (auto code : child2->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+            curNode->result = child2->result;        
+            curNode->type = child2->type;
+        }
+        curNode->opType = child3->opType;
+    }
+|  
+    {
+        ($$) = NULL;
+    }
+;
+
+factor:
+    factor_prefix postfix_expr
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        if (child1 && child2) 
+        {   
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+            for (auto code : child2->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+            string OPTYPE = child1->opType;
+            if (child1->type == "INT") 
+            {
+                OPTYPE += "I ";
+            }
+            else if (child1->type == "FLOAT") 
+            {
+                OPTYPE += "F ";
+            }
+            curNode->factor_1 = child1->result;
+            curNode->factor_2 = child2->result;
+            curNode->result = generateRegister();
+            curNode->curInstruction = OPTYPE + curNode->factor_1 + " " + curNode->factor_2 + " " + curNode->result;
+            curNode->codeGenList.push_back(curNode->curInstruction);
+            curNode->curInstruction = "";
+            curNode->type = child1->type;
+        }
+        else 
+        {
+            for (auto code : child2->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+            curNode->result = child2->result;
+            curNode->type = child2->type;
+        }
+    }
+;
+factor_prefix:
+    factor_prefix postfix_expr mulop
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        ASTnode1* child3 = ($3);
+        if (child1 && child2) {       
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+            for (auto code : child2->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+            curNode->factor_1 = child1->result;
+            curNode->factor_2 = child2->result;
+            curNode->result = generateRegister();
+            string OPTYPE = child1->opType;
+
+            if (child1->type == "INT") 
+            {
+                OPTYPE += "I ";
+            }
+            else if (child1->type == "FLOAT") 
+            {
+                OPTYPE += "F ";
+            }
+            curNode->curInstruction = OPTYPE + curNode->factor_1 + " " + curNode->factor_2 + " " + curNode->result;
+            curNode->codeGenList.push_back(curNode->curInstruction);
+            curNode->curInstruction = "";
+            curNode->type = child1->type;
+        }
+        else 
+        {
+            for (auto code : child2->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+            curNode->result = child2->result;
+            curNode->type = child2->type;
+        }
+        if (child3) 
+        {
+            curNode->opType = child3->opType;
+        }
+    }
+| 
+    {
+        ($$) = NULL;
+    }
+;
+postfix_expr:
+    primary
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        if (child1) 
+        {
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+            curNode->result = child1->result;
+            curNode->type = child1->type;
+        }
+    }
+|   call_expr 
+    {
+        ($$) = ($1);
+    }
+;
+call_expr:
+    IDENTIFIER LEFT_PAR expr_list RIGHT_PAR
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($3);
+        if (child1) 
+        {
+            for (int i = child1->expressions.size() - 1; i >= 0; i--) 
+            {
+                curNode->expressions.push_back(child1->expressions[i]);
+            }
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        // for return value
+        curNode->result = generateRegister();
+        vector<string> pushInstructions;
+        // for return value
+        pushInstructions.push_back("push");
+        // for pushing arguments
+        for (auto expr : curNode->expressions) 
+        {
+            pushInstructions.push_back("push " + expr->result);
+        }
+        // push instructions
+        for (int i = 0; i < pushInstructions.size(); i++) 
+        {
+            curNode->codeGenList.push_back(pushInstructions[i]);
+        }
+        // call instruction
+        curNode->codeGenList.push_back("jsr " + ($1)->first);
+        // pop instructions for popping arguments
+        for (int i = 0; i < pushInstructions.size()-1; i++) {
+            curNode->codeGenList.push_back("pop");
+        }
+        // pop instruction for storing the return value
+        curNode->codeGenList.push_back("pop " + curNode->result);
+        curNode->type = FRM[$1->first];
+    }
+;
+
+expr_list:
+    expr expr_list_tail
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        if (child1) {
+            curNode->expressions.push_back(child1);
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) {
+            for (auto code : child2->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+            for (auto expr : child2->expressions) {
+                curNode->expressions.push_back(expr);
+            }
+        }
+    }
+|
+    {
+        ($$) = NULL;
+    }
+;
+expr_list_tail:
+    COMMA expr expr_list_tail
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($2);
+        ASTnode1* child2 = ($3);
+        if (child1) {
+            curNode->expressions.push_back(child1);
+            for (auto code : child1->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) {
+            for (auto expr : child2->expressions) {
+                curNode->expressions.push_back(expr);
+            }
+            for (auto code : child2->codeGenList) {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|
+    {
+        ($$) = NULL;
+    }
+;
+primary:
+    LEFT_PAR 
+    expr 
+    RIGHT_PAR
+    {
+        ($$) = ($2);
+    }
+|   
+    IDENTIFIER
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        string ID = ($1)->first.c_str();
+        bool found = false;
+        int IDX = -1;
+        for (int symidx = PST.size()-1; symidx >= 0; symidx--) {
+            if (found) break;
+            for (int i = 0; i < PST[symidx]->VARS.size(); i++) 
+            {
+                if (ID == PST[symidx]->VARS[i]->id) 
+                {
+                    found = true;
+                    if (PST[symidx]->VARS[i]->type == "INT") 
+                    {
+                        curNode->type = "INT";
+                    }
+                    else {
+                        curNode->type = "FLOAT";
+                    }
+                    IDX = symidx;
+                    break;       
+                }
+            }
+        }    
+        if (IDX == 0) curNode->result = ID;
+        else curNode->result = PST[IDX]->varMap[ID];
+    }
+|   
+    INTLITERAL
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        curNode->type = "INT";
+        curNode->result = generateRegister();
+        string INTLIT = ($1 != NULL) ? (string) $1 : "";
+        curNode->curInstruction = "STOREI " + INTLIT + " " + curNode->result;
+        curNode->codeGenList.push_back(curNode->curInstruction);
+        curNode->curInstruction = "";
+    }
+|   
+    FLOATLITERAL
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        curNode->type = "FLOAT";
+        curNode->result = generateRegister();
+        string FLTLIT = ($1 != NULL) ? (string) $1 : "";
+        curNode->curInstruction = "STOREF " + FLTLIT + " " + curNode->result;
+        curNode->codeGenList.push_back(curNode->curInstruction);
+        curNode->curInstruction = "";
+    }
+;
+addop:
+    PLUS
+    {
+        ($$) = new ASTnode1();
+        ($$)->opType = "ADD";
+    }
+|   MINUS
+    {
+        ($$) = new ASTnode1();
+        ($$)->opType = "SUB";
+    }
+;
+mulop:
+    MUL 
+    {
+        ($$) = new ASTnode1();
+        ($$)->opType = "MUL";
+    }
+|   DIV 
+    {
+        ($$) = new ASTnode1();
+        ($$)->opType = "DIV";
+    }
+;
+/******************************************************/
+/* Complex Statements like (IF, WHILE) and Conditions */
+/******************************************************/
+if_stmt:
+    IF 
+    {   
+        curST = new SYMBOL_TABLE();
+        curST->st_name = "BLOCK"+to_string(blockCounter);
+        blockCounter++;
+        symbol_tables.push_back(curST);
+        PST.push_back(curST);
+    }
+    LEFT_PAR cond RIGHT_PAR 
+    decl stmt_list 
+    {
+        PST.pop_back();        
+    }
+    else_part 
+    ENDIF
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($4);
+        ASTnode1* child2 = ($6);
+        ASTnode1* child3 = ($7);
+        ASTnode1* child4 = ($9);
+        if (child1) 
+        {
+            string label = generateLabel();
+            string outLabel = generateLabel();
+            // cond
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+            string jmpIns = child1->jumpIns + " " + label;
+            curNode->codeGenList.push_back(jmpIns);
+            // then
+            if (child2) 
+            {
+                for (auto code : child2->codeGenList) 
+                {
+                    curNode->codeGenList.push_back(code);
+                }
+            }
+            if (child3) 
+            {
+                for (auto code : child3->codeGenList) 
+                {
+                    curNode->codeGenList.push_back(code);
+                }
+            }
+            string outIns = "jmp " + outLabel;
+            curNode->codeGenList.push_back(outIns);
+            string labelIns = "label " + label;
+            curNode->codeGenList.push_back(labelIns);
+            // else
+            if (child4) 
+            {
+                for (auto code : child4->codeGenList) 
+                {
+                    curNode->codeGenList.push_back(code);
+                }
+            }
+            string outLabelIns = "label " + outLabel;
+            curNode->codeGenList.push_back(outLabelIns);   
+        }
+    }
+;
+else_part:
+    ELSE 
+    {   
+        curST = new SYMBOL_TABLE();
+        curST->st_name = "BLOCK"+to_string(blockCounter);
+        blockCounter++;
+        symbol_tables.push_back(curST);
+        PST.push_back(curST);
+    }
+    decl stmt_list 
+    {
+        PST.pop_back();
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($3);
+        ASTnode1* child2 = ($4);
+        if (child1) 
+        {
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) 
+        {
+            for (auto code : child2->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|
+    {
+        ($$) = NULL;
+    }
+;
+cond:
+    expr compop expr
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        ASTnode1* child3 = ($3);
+        if (child1) 
+        {
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child3) 
+        {
+            for (auto code : child3->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        string cmpIns = "";
+        if (child1->type == "INT") 
+        {
+            cmpIns = "cmpi " + child1->result + " " + child3->result;
+        } 
+        else if (child1->type == "FLOAT")
+        {
+            cmpIns = "cmpr " + child1->result + " " + child3->result;
+        }
+        curNode->codeGenList.push_back(cmpIns);
+        curNode->jumpIns = child2->jumpIns;
+    }
+;
+
+compop:
+    EQ 
+    {
+        ($$) = new ASTnode1();
+        ($$)->jumpIns = "jne";
+    }
+|   NEQ
+    {
+        ($$) = new ASTnode1();
+        ($$)->jumpIns = "jeq";
+    }
+|   GT
+    {
+        ($$) = new ASTnode1();
+        ($$)->jumpIns = "jle";
+    }
+|   GEQ
+    {
+        ($$) = new ASTnode1();
+        ($$)->jumpIns = "jlt";
+    }
+|   LT
+    {
+        ($$) = new ASTnode1();
+        ($$)->jumpIns = "jge";
+    } 
+|   LEQ
+    {
+        ($$) = new ASTnode1();
+        ($$)->jumpIns = "jgt";
+    }
+;
+while_stmt:
+    WHILE 
+    {
+        curST = new SYMBOL_TABLE();
+        curST->st_name = "BLOCK" + to_string(blockCounter);
+        blockCounter++;
+        symbol_tables.push_back(curST);
+        PST.push_back(curST);
+    }
+    LEFT_PAR cond RIGHT_PAR decl aug_stmt_list ENDWHILE
+    {
+        PST.pop_back();
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($4);
+        ASTnode1* child2 = ($6);
+        ASTnode1* child3 = ($7);
+        string startLabel = generateLabel();
+        string outLabel = generateLabel();
+        string startLabelIns = "label " + startLabel;
+        curNode->codeGenList.push_back(startLabelIns);
+        // cond
+        for (auto code : child1->codeGenList) 
+        {
+            curNode->codeGenList.push_back(code);
+        }
+        string jmpIns = child1->jumpIns + " " + outLabel;
+        curNode->codeGenList.push_back(jmpIns);
+        // stmt
+        if (child2) 
+        {
+            for (auto code : child2->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child3) 
+        {
+            for (auto code : child3->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        string jmpStartIns = "jmp " + startLabel;
+        curNode->codeGenList.push_back(jmpStartIns);
+        string outLabelIns = "label " + outLabel;
+        curNode->codeGenList.push_back(outLabelIns);
+        for (int i = 0; i < curNode->codeGenList.size(); i++) 
+        {
+            if (curNode->codeGenList[i] == "break") {
+                curNode->codeGenList[i] = "jmp " + outLabel;
+            } 
+            if (curNode->codeGenList[i] == "continue") {
+                curNode->codeGenList[i] = "jmp " + startLabel;
+            }
+        }
+    }
+;
+aug_stmt_list:
+    aug_stmt aug_stmt_list
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        ASTnode1* child2 = ($2);
+        if (child1) 
+        {
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) 
+        {
+            for (auto code : child2->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|
+    {
+        ($$) = NULL;
+    }
+;
+aug_stmt:
+    base_stmt 
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        if (child1) 
+        {
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|   aug_if_stmt 
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        if (child1) 
+        {
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|   while_stmt 
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($1);
+        if (child1) 
+        {
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|   CONTINUE SEMICOL
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        string continueIns = "continue";
+        curNode->codeGenList.push_back(continueIns);
+    }
+|   BREAK SEMICOL 
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        string breakIns = "break";
+        curNode->codeGenList.push_back(breakIns);
+    }
+;
+aug_if_stmt:
+    IF LEFT_PAR
+    {   
+        curST = new SYMBOL_TABLE();
+        curST->st_name = "BLOCK"+to_string(blockCounter);
+        blockCounter++;
+        symbol_tables.push_back(curST);
+        PST.push_back(curST);
+    }
+    cond RIGHT_PAR decl aug_stmt_list 
+    {
+        PST.pop_back();
+    }
+    aug_else_part ENDIF
+    {
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($4);
+        ASTnode1* child2 = ($6);
+        ASTnode1* child3 = ($7);
+        ASTnode1* child4 = ($9);
+        if (child1) 
+        {
+            string label = generateLabel();
+            string outLabel = generateLabel();
+            // cond
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+            string jmpIns = child1->jumpIns + " " + label;
+            curNode->codeGenList.push_back(jmpIns);
+            // then
+            if (child2) 
+            {
+                for (auto code : child2->codeGenList) 
+                {
+                    curNode->codeGenList.push_back(code);
+                }
+            }
+            if (child3) 
+            {
+                for (auto code : child3->codeGenList) 
+                {
+                    curNode->codeGenList.push_back(code);
+                }
+            }
+            string outIns = "jmp " + outLabel;
+            curNode->codeGenList.push_back(outIns);
+            string labelIns = "label " + label;
+            curNode->codeGenList.push_back(labelIns);
+            // else
+            if (child4) 
+            {
+                for (auto code : child4->codeGenList) 
+                {
+                    curNode->codeGenList.push_back(code);
+                }
+            }
+            string outLabelIns = "label " + outLabel;
+            curNode->codeGenList.push_back(outLabelIns);   
+        }
+    }
+;
+aug_else_part:
+    ELSE 
+    {
+        curST = new SYMBOL_TABLE();
+        curST->st_name = "BLOCK"+to_string(blockCounter);
+        blockCounter++;
+        symbol_tables.push_back(curST);
+        PST.push_back(curST);
+    }
+    decl aug_stmt_list
+    {
+        PST.pop_back();
+        ($$) = new ASTnode1();
+        ASTnode1* curNode = ($$);
+        ASTnode1* child1 = ($3);
+        ASTnode1* child2 = ($4);
+        if (child1) 
+        {
+            for (auto code : child1->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+        if (child2) 
+        {
+            for (auto code : child2->codeGenList) 
+            {
+                curNode->codeGenList.push_back(code);
+            }
+        }
+    }
+|
+    {
+        ($$) = NULL;
+    }
+;
+/******************************************************************/
+%%
